@@ -1,0 +1,10 @@
+{
+	"luci-app-wifimon": {
+		"description": "Grant access to WiFi Monitor",
+		"read": {
+			"ubus": {
+				"wifimon": ["get_clients", "get_dns_history"]
+			}
+		}
+	}
+}
