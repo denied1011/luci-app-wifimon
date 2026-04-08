@@ -68,11 +68,10 @@ return view.extend({
 		return callGetClients();
 	},
 
-	render: function(clients) {
-		// State: which MAC's DNS panel is open (persists across polls)
+	render: function(initialClients) {
 		var openDnsMac = null;
-		// Cache of DNS panel DOM nodes keyed by MAC
-		var dnsPanels = {};
+		// cards[mac] = { card: Element, refs: {field: Element}, dnsDiv: Element }
+		var cards = {};
 
 		var css = E('style', {}, [
 			'.wifimon-wrap { font-family: sans-serif; }',
@@ -109,36 +108,132 @@ return view.extend({
 		container.appendChild(countDiv);
 		container.appendChild(listDiv);
 
-		function fetchDns(mac, ip, dnsDiv) {
+		function fetchDns(ip, dnsDiv) {
 			dom.content(dnsDiv, [
-				E('div', { 'class': 'wifimon-dns-title' }, '\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b:'),
-				E('div', { 'class': 'wifimon-dns-loading' }, '\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430...')
+				E('div', { 'class': 'wifimon-dns-title' }, 'Последние DNS-запросы:'),
+				E('div', { 'class': 'wifimon-dns-loading' }, 'Загрузка...')
 			]);
-
 			callGetDnsHistory(ip).then(function(hosts) {
 				var content = [
 					E('div', { 'class': 'wifimon-dns-title' },
-						'\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b (' + ip + '):')
+						'Последние DNS-запросы (' + ip + '):')
 				];
 				if (hosts && hosts.length) {
 					var ul = E('ul', { 'class': 'wifimon-dns-list' });
 					hosts.forEach(function(h) { ul.appendChild(E('li', {}, h)); });
 					content.push(ul);
 				} else {
-					content.push(E('div', { 'class': 'wifimon-dns-loading' }, '\u041d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445'));
+					content.push(E('div', { 'class': 'wifimon-dns-loading' }, 'Нет данных'));
 				}
 				dom.content(dnsDiv, content);
 			}).catch(function() {
 				dom.content(dnsDiv, [
-					E('div', { 'class': 'wifimon-dns-title' }, '\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b:'),
-					E('div', { 'class': 'wifimon-dns-loading' }, '\u041e\u0448\u0438\u0431\u043a\u0430 \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438')
+					E('div', { 'class': 'wifimon-dns-title' }, 'Последние DNS-запросы:'),
+					E('div', { 'class': 'wifimon-dns-loading' }, 'Ошибка загрузки')
 				]);
 			});
 		}
 
+		// Create a new card for a client, return { card, refs, dnsDiv }
+		function createCard(client) {
+			var mac = client.mac;
+			var refs = {};
+
+			var dnsDiv = E('div', { 'class': 'wifimon-dns' });
+
+			refs.name = E('span', { 'class': 'wifimon-name' });
+			refs.macSpan = E('span', { 'class': 'wifimon-mac' });
+			refs.ip = E('span', { 'class': 'wifimon-ip' });
+			refs.band = E('span', { 'class': 'wifimon-band' });
+			refs.signalIcon = E('span', { 'class': 'wifimon-signal' });
+			refs.signalText = E('span', {});
+			// iw tx = router sends to client = client download (↓)
+			// iw rx = router gets from client = client upload (↑)
+			refs.dlSpeed = E('span', { 'class': 'wifimon-speed wifimon-speed-down' });
+			refs.ulSpeed = E('span', { 'class': 'wifimon-speed wifimon-speed-up' });
+			refs.rxRate = E('b', {});
+			refs.txRate = E('b', {});
+			refs.dlTotal = E('b', {});
+			refs.ulTotal = E('b', {});
+			refs.uptime = E('b', {});
+
+			var card = E('div', { 'class': 'wifimon-card', 'data-mac': mac }, [
+				E('div', { 'class': 'wifimon-card-header' }, [
+					E('div', {}, [refs.name, refs.macSpan]),
+					E('div', { 'style': 'display:flex; align-items:center; gap:10px;' }, [
+						refs.ip, refs.band
+					])
+				]),
+				E('div', { 'class': 'wifimon-stats' }, [
+					E('span', { 'class': 'wifimon-stat' }, [refs.signalIcon, refs.signalText]),
+					E('span', { 'class': 'wifimon-stat' }, ['\u2193 ', refs.dlSpeed]),
+					E('span', { 'class': 'wifimon-stat' }, ['\u2191 ', refs.ulSpeed]),
+					E('span', { 'class': 'wifimon-stat' }, ['RX: ', refs.rxRate]),
+					E('span', { 'class': 'wifimon-stat' }, ['TX: ', refs.txRate]),
+					E('span', { 'class': 'wifimon-stat' }, ['Всего \u2193 ', refs.dlTotal]),
+					E('span', { 'class': 'wifimon-stat' }, ['Всего \u2191 ', refs.ulTotal]),
+					E('span', { 'class': 'wifimon-stat' }, ['Онлайн: ', refs.uptime]),
+				]),
+				dnsDiv
+			]);
+
+			card.addEventListener('click', function(ev) {
+				ev.stopPropagation();
+
+				if (openDnsMac === mac) {
+					dnsDiv.classList.remove('open');
+					openDnsMac = null;
+					return;
+				}
+
+				// Close previous
+				if (openDnsMac && cards[openDnsMac]) {
+					cards[openDnsMac].dnsDiv.classList.remove('open');
+				}
+
+				openDnsMac = mac;
+				dnsDiv.classList.add('open');
+
+				var curIp = card.getAttribute('data-ip');
+				if (curIp && curIp !== 'N/A') {
+					fetchDns(curIp, dnsDiv);
+				}
+			});
+
+			return { card: card, refs: refs, dnsDiv: dnsDiv };
+		}
+
+		// Update an existing card's displayed values
+		function updateCard(entry, client) {
+			var r = entry.refs;
+			var hasName = client.hostname && client.hostname !== 'unknown';
+
+			r.name.textContent = hasName ? client.hostname : client.mac;
+			r.macSpan.textContent = hasName ? ' (' + client.mac + ')' : '';
+			r.ip.textContent = client.ip || '';
+			r.band.textContent = client.band;
+			r.band.className = 'wifimon-band ' + (client.band === '5GHz' ? 'wifimon-band-5' : 'wifimon-band-2');
+
+			r.signalIcon.textContent = signalIcon(client.signal);
+			r.signalIcon.style.color = signalColor(client.signal);
+			r.signalText.textContent = ' ' + client.signal + ' dBm';
+
+			// iw tx_speed = router->client = download for client (↓)
+			// iw rx_speed = client->router = upload for client (↑)
+			r.dlSpeed.textContent = formatSpeed(client.tx_speed);
+			r.ulSpeed.textContent = formatSpeed(client.rx_speed);
+			r.rxRate.textContent = client.rx_bitrate || '-';
+			r.txRate.textContent = client.tx_bitrate || '-';
+			r.dlTotal.textContent = formatBytes(client.tx_bytes);
+			r.ulTotal.textContent = formatBytes(client.rx_bytes);
+			r.uptime.textContent = formatTime(client.connected_time);
+
+			entry.card.setAttribute('data-ip', client.ip || '');
+		}
+
 		function renderClients(data) {
 			var count = data ? data.length : 0;
-			countDiv.textContent = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432: ' + count;
+			countDiv.textContent = 'Подключено устройств: ' + count;
 
 			if (data && data.length) {
 				data.sort(function(a, b) {
@@ -147,126 +242,66 @@ return view.extend({
 				});
 			}
 
-			dom.content(listDiv, []);
-
 			if (!count) {
-				listDiv.appendChild(E('div', { 'class': 'wifimon-empty' }, '\u041d\u0435\u0442 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d\u043d\u044b\u0445 \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432'));
+				// Remove all cards
+				Object.keys(cards).forEach(function(m) {
+					if (cards[m].card.parentNode) cards[m].card.parentNode.removeChild(cards[m].card);
+					delete cards[m];
+				});
+				if (!listDiv.querySelector('.wifimon-empty')) {
+					listDiv.appendChild(E('div', { 'class': 'wifimon-empty' }, 'Нет подключённых устройств'));
+				}
+				openDnsMac = null;
 				return;
 			}
 
+			// Remove empty placeholder if present
+			var emptyEl = listDiv.querySelector('.wifimon-empty');
+			if (emptyEl) emptyEl.parentNode.removeChild(emptyEl);
+
+			// Build set of current MACs
+			var currentMacs = {};
+			data.forEach(function(c) { currentMacs[c.mac] = true; });
+
+			// Remove cards for disconnected clients
+			Object.keys(cards).forEach(function(m) {
+				if (!currentMacs[m]) {
+					if (cards[m].card.parentNode) cards[m].card.parentNode.removeChild(cards[m].card);
+					delete cards[m];
+					if (openDnsMac === m) openDnsMac = null;
+				}
+			});
+
+			// Create or update cards, and reorder
+			var prevNode = null;
 			data.forEach(function(client) {
 				var mac = client.mac;
+				var entry = cards[mac];
 
-				// Reuse existing DNS panel or create new one
-				var dnsDiv;
-				if (dnsPanels[mac]) {
-					dnsDiv = dnsPanels[mac];
-				} else {
-					dnsDiv = E('div', { 'class': 'wifimon-dns' }, [
-						E('div', { 'class': 'wifimon-dns-title' }, '\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b:'),
-						E('div', { 'class': 'wifimon-dns-loading' }, '\u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u0434\u043b\u044f \u0437\u0430\u0433\u0440\u0443\u0437\u043a\u0438...')
-					]);
-					dnsPanels[mac] = dnsDiv;
+				if (!entry) {
+					entry = createCard(client);
+					cards[mac] = entry;
 				}
 
-				// Restore open state if this was the open panel
-				if (openDnsMac === mac) {
-					dnsDiv.classList.add('open');
+				updateCard(entry, client);
+
+				// Ensure correct order in DOM
+				var cardEl = entry.card;
+				if (prevNode) {
+					if (prevNode.nextSibling !== cardEl) {
+						listDiv.insertBefore(cardEl, prevNode.nextSibling);
+					}
 				} else {
-					dnsDiv.classList.remove('open');
+					if (listDiv.firstChild !== cardEl) {
+						listDiv.insertBefore(cardEl, listDiv.firstChild);
+					}
 				}
-
-				var card = E('div', { 'class': 'wifimon-card' }, [
-					E('div', { 'class': 'wifimon-card-header' }, [
-						E('div', {}, [
-							E('span', { 'class': 'wifimon-name' },
-								client.hostname && client.hostname !== 'unknown' ? client.hostname : client.mac),
-							client.hostname && client.hostname !== 'unknown'
-								? E('span', { 'class': 'wifimon-mac' }, ' (' + client.mac + ')')
-								: E('span', {}),
-						]),
-						E('div', { 'style': 'display:flex; align-items:center; gap:10px;' }, [
-							E('span', { 'class': 'wifimon-ip' }, client.ip || ''),
-							E('span', {
-								'class': 'wifimon-band ' + (client.band === '5GHz' ? 'wifimon-band-5' : 'wifimon-band-2')
-							}, client.band),
-						])
-					]),
-					E('div', { 'class': 'wifimon-stats' }, [
-						E('span', { 'class': 'wifimon-stat' }, [
-							E('span', {
-								'class': 'wifimon-signal',
-								'style': 'color:' + signalColor(client.signal)
-							}, signalIcon(client.signal)),
-							E('span', {}, ' ' + client.signal + ' dBm')
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'\u2193 ',
-							E('span', { 'class': 'wifimon-speed wifimon-speed-down' },
-								formatSpeed(client.rx_speed))
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'\u2191 ',
-							E('span', { 'class': 'wifimon-speed wifimon-speed-up' },
-								formatSpeed(client.tx_speed))
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'RX: ', E('b', {}, client.rx_bitrate || '-')
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'TX: ', E('b', {}, client.tx_bitrate || '-')
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'\u0412\u0441\u0435\u0433\u043e \u2193 ', E('b', {}, formatBytes(client.rx_bytes))
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'\u0412\u0441\u0435\u0433\u043e \u2191 ', E('b', {}, formatBytes(client.tx_bytes))
-						]),
-						E('span', { 'class': 'wifimon-stat' }, [
-							'\u041e\u043d\u043b\u0430\u0439\u043d: ', E('b', {}, formatTime(client.connected_time))
-						]),
-					]),
-					dnsDiv
-				]);
-
-				card.addEventListener('click', function(ev) {
-					ev.stopPropagation();
-
-					if (openDnsMac === mac) {
-						// Click same card — close it
-						dnsDiv.classList.remove('open');
-						openDnsMac = null;
-						return;
-					}
-
-					// Close previous panel
-					if (openDnsMac && dnsPanels[openDnsMac]) {
-						dnsPanels[openDnsMac].classList.remove('open');
-					}
-
-					// Open this panel and always re-fetch DNS
-					openDnsMac = mac;
-					dnsDiv.classList.add('open');
-					if (client.ip && client.ip !== 'N/A') {
-						fetchDns(mac, client.ip, dnsDiv);
-					}
-				});
-
-				listDiv.appendChild(card);
+				prevNode = cardEl;
 			});
-
-			// Clean up panels for disconnected clients
-			var activeMacs = {};
-			data.forEach(function(c) { activeMacs[c.mac] = true; });
-			Object.keys(dnsPanels).forEach(function(m) {
-				if (!activeMacs[m]) delete dnsPanels[m];
-			});
-			if (openDnsMac && !activeMacs[openDnsMac]) openDnsMac = null;
 		}
 
-		renderClients(clients);
+		renderClients(initialClients);
 
-		// Poll every 5 seconds
 		poll.add(function() {
 			return callGetClients().then(function(data) {
 				renderClients(data);
