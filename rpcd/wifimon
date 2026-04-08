@@ -1,146 +1,154 @@
 #!/bin/sh
 
 # LuCI rpcd backend for WiFi Monitor
-# Provides: list of connected WiFi clients, per-client DNS history, traffic stats
+# Optimized for low-memory routers: minimal fork/exec, single-pass parsing
 
 . /usr/share/libubox/jshn.sh
 
 CACHE_DIR="/tmp/wifimon"
 mkdir -p "$CACHE_DIR"
 
-# Get hostname from DHCP leases by MAC
-get_hostname_by_mac() {
-	local mac="$1"
-	local mac_lower=$(echo "$mac" | tr 'A-Z' 'a-z')
-	local name=""
-	# Check DHCP leases
-	name=$(awk -v m="$mac_lower" 'tolower($2)==m {print $4}' /tmp/dhcp.leases 2>/dev/null)
-	[ -n "$name" ] && [ "$name" != "*" ] && echo "$name" && return
-	echo ""
-}
-
-# Get IP from DHCP leases by MAC
-get_ip_by_mac() {
-	local mac="$1"
-	local mac_lower=$(echo "$mac" | tr 'A-Z' 'a-z')
-	awk -v m="$mac_lower" 'tolower($2)==m {print $3}' /tmp/dhcp.leases 2>/dev/null | head -1
-}
-
-# Emit one station record
-emit_station() {
-	local mac="$1" band="$2" signal="$3" tx_bitrate="$4" rx_bitrate="$5"
-	local rx_bytes="$6" tx_bytes="$7" inactive="$8" connected="$9"
-	[ -z "$mac" ] && return
-	local ip=$(get_ip_by_mac "$mac")
-	local hostname=$(get_hostname_by_mac "$mac")
-	echo "${mac}|${ip}|${hostname}|${band}|${signal}|${tx_bitrate}|${rx_bitrate}|${rx_bytes}|${tx_bytes}|${inactive}|${connected}"
-}
-
-# Parse iw station dump for one interface
-parse_stations() {
-	local iface="$1"
-	local band="$2"
-	local dump_file="$CACHE_DIR/iw_dump_$$"
-	iw dev "$iface" station dump 2>/dev/null > "$dump_file"
-
-	local cur_mac=""
-	local cur_rx_bytes="" cur_tx_bytes="" cur_signal="" cur_tx_bitrate="" cur_rx_bitrate=""
-	local cur_inactive="" cur_connected=""
-
-	while IFS= read -r line; do
-		case "$line" in
-			Station\ *)
-				emit_station "$cur_mac" "$band" "$cur_signal" "$cur_tx_bitrate" "$cur_rx_bitrate" "$cur_rx_bytes" "$cur_tx_bytes" "$cur_inactive" "$cur_connected"
-				cur_mac=$(echo "$line" | awk '{print $2}')
-				cur_rx_bytes="" ; cur_tx_bytes="" ; cur_signal=""
-				cur_tx_bitrate="" ; cur_rx_bitrate="" ; cur_inactive="" ; cur_connected=""
-				;;
-			*"rx bytes:"*)
-				cur_rx_bytes=$(echo "$line" | awk '{print $3}')
-				;;
-			*"tx bytes:"*)
-				cur_tx_bytes=$(echo "$line" | awk '{print $3}')
-				;;
-			*"signal:"*)
-				[ -z "$cur_signal" ] && cur_signal=$(echo "$line" | awk '{print $2}')
-				;;
-			*"tx bitrate:"*)
-				cur_tx_bitrate=$(echo "$line" | sed 's/.*tx bitrate:[[:space:]]*//' | sed 's/[[:space:]]*$//')
-				;;
-			*"rx bitrate:"*)
-				cur_rx_bitrate=$(echo "$line" | sed 's/.*rx bitrate:[[:space:]]*//' | sed 's/[[:space:]]*$//')
-				;;
-			*"inactive time:"*)
-				cur_inactive=$(echo "$line" | awk '{print $3}')
-				;;
-			*"connected time:"*)
-				cur_connected=$(echo "$line" | awk '{print $3}')
-				;;
-		esac
-	done < "$dump_file"
-
-	# Output last station
-	emit_station "$cur_mac" "$band" "$cur_signal" "$cur_tx_bitrate" "$cur_rx_bitrate" "$cur_rx_bytes" "$cur_tx_bytes" "$cur_inactive" "$cur_connected"
-
-	rm -f "$dump_file"
-}
-
-# Get all WiFi clients as JSON
+# Get all WiFi clients as JSON — single awk pass, no per-line forks
 get_clients() {
-	json_init
-
-	# Save previous stats for speed calculation
 	local prev_file="$CACHE_DIR/prev_stats"
+	local tmpfile="$CACHE_DIR/current_stats"
 	local now=$(date +%s)
 	local prev_time=0
-	[ -f "$prev_file" ] && prev_time=$(head -1 "$prev_file")
+	[ -f "$prev_file" ] && read prev_time < "$prev_file"
 
 	local elapsed=0
 	[ "$prev_time" -gt 0 ] 2>/dev/null && elapsed=$((now - prev_time))
 
-	# Collect current data from all WiFi interfaces
-	local tmpfile="$CACHE_DIR/current_stats"
-	{
-		# Detect WiFi interfaces
-		for iface in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
-			local freq=$(iw dev "$iface" info 2>/dev/null | awk '/channel/{print $2}')
-			local band="2.4GHz"
-			[ "${freq:-0}" -ge 36 ] && band="5GHz"
-			parse_stations "$iface" "$band"
-		done
-	} > "$tmpfile"
+	# Single awk: parse iw dump + join with dhcp.leases + compute speed
+	# Step 1: dump all interfaces into one temp file with band marker
+	local raw="$CACHE_DIR/raw_dump"
+	: > "$raw"
+	for iface in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+		local ch=$(iw dev "$iface" info 2>/dev/null | awk '/channel/{print $2; exit}')
+		local band="2.4GHz"
+		[ "${ch:-0}" -ge 36 ] && band="5GHz"
+		echo "##BAND##${band}"
+		iw dev "$iface" station dump 2>/dev/null
+	done > "$raw"
 
+	# Step 2: single awk parses everything
+	awk -v prev_file="$prev_file" -v elapsed="$elapsed" -v leases="/tmp/dhcp.leases" '
+	BEGIN {
+		# Load DHCP leases: mac -> ip, mac -> hostname
+		while ((getline line < leases) > 0) {
+			n = split(line, f, " ")
+			if (n >= 4) {
+				mac = tolower(f[2])
+				ip_map[mac] = f[3]
+				if (f[4] != "*") host_map[mac] = f[4]
+			}
+		}
+		close(leases)
+
+		# Load previous byte counters
+		if (elapsed > 0) {
+			first = 1
+			while ((getline line < prev_file) > 0) {
+				if (first) { first = 0; continue }
+				n = split(line, f, "|")
+				if (n >= 3) {
+					prev_rx[tolower(f[1])] = f[2]
+					prev_tx[tolower(f[1])] = f[3]
+				}
+			}
+			close(prev_file)
+		}
+
+		band = "2.4GHz"
+		cnt = 0
+	}
+
+	/^##BAND##/ { band = substr($0, 9); next }
+
+	/^Station / {
+		if (cur_mac != "") emit()
+		cur_mac = tolower($2)
+		cur_band = band
+		cur_signal = ""; cur_rx_bytes = 0; cur_tx_bytes = 0
+		cur_tx_rate = ""; cur_rx_rate = ""
+		cur_inactive = 0; cur_connected = 0
+		next
+	}
+
+	/rx bytes:/ && !/drop/ { cur_rx_bytes = $3; next }
+	/tx bytes:/ && !/drop/ { cur_tx_bytes = $3; next }
+	/^\tsignal:/ { cur_signal = $2; next }
+	/tx bitrate:/ {
+		sub(/.*tx bitrate:[ \t]*/, "")
+		sub(/[ \t]*$/, "")
+		cur_tx_rate = $0
+		next
+	}
+	/rx bitrate:/ {
+		sub(/.*rx bitrate:[ \t]*/, "")
+		sub(/[ \t]*$/, "")
+		cur_rx_rate = $0
+		next
+	}
+	/inactive time:/ { cur_inactive = $3; next }
+	/connected time:/ { cur_connected = $3; next }
+
+	function emit() {
+		cnt++
+		macs[cnt] = cur_mac
+		bands[cnt] = cur_band
+		signals[cnt] = (cur_signal != "") ? cur_signal : 0
+		rx_bytes[cnt] = cur_rx_bytes
+		tx_bytes[cnt] = cur_tx_bytes
+		tx_rates[cnt] = cur_tx_rate
+		rx_rates[cnt] = cur_rx_rate
+		inactives[cnt] = cur_inactive
+		connecteds[cnt] = cur_connected
+
+		ip = (cur_mac in ip_map) ? ip_map[cur_mac] : "N/A"
+		ips[cnt] = ip
+		hostname = (cur_mac in host_map) ? host_map[cur_mac] : "unknown"
+		hostnames[cnt] = hostname
+
+		rx_spd = 0; tx_spd = 0
+		if (elapsed > 0 && cur_mac in prev_rx) {
+			rx_spd = int((cur_rx_bytes - prev_rx[cur_mac]) / elapsed)
+			tx_spd = int((cur_tx_bytes - prev_tx[cur_mac]) / elapsed)
+			if (rx_spd < 0) rx_spd = 0
+			if (tx_spd < 0) tx_spd = 0
+		}
+		rx_speeds[cnt] = rx_spd
+		tx_speeds[cnt] = tx_spd
+	}
+
+	END {
+		if (cur_mac != "") emit()
+
+		# Output pipe-delimited for shell to build JSON
+		for (i = 1; i <= cnt; i++) {
+			print macs[i] "|" ips[i] "|" hostnames[i] "|" bands[i] "|" signals[i] "|" tx_rates[i] "|" rx_rates[i] "|" rx_bytes[i] "|" tx_bytes[i] "|" rx_speeds[i] "|" tx_speeds[i] "|" inactives[i] "|" connecteds[i]
+		}
+	}
+	' "$raw" > "$tmpfile"
+
+	# Build JSON from parsed data
+	json_init
 	json_add_array "clients"
 
-	while IFS='|' read -r mac ip hostname band signal tx_bitrate rx_bitrate rx_bytes tx_bytes inactive connected; do
+	while IFS='|' read -r mac ip hostname band signal tx_bitrate rx_bitrate rx_bytes tx_bytes rx_speed tx_speed inactive connected; do
 		[ -z "$mac" ] && continue
-
-		# Calculate speed from previous measurement
-		local rx_speed=0 tx_speed=0
-		if [ "$elapsed" -gt 0 ] && [ -f "$prev_file" ]; then
-			local prev_rx=$(grep "^${mac}|" "$prev_file" | cut -d'|' -f2)
-			local prev_tx=$(grep "^${mac}|" "$prev_file" | cut -d'|' -f3)
-			if [ -n "$prev_rx" ] && [ -n "$prev_tx" ]; then
-				rx_speed=$(( (rx_bytes - prev_rx) / elapsed ))
-				tx_speed=$(( (tx_bytes - prev_tx) / elapsed ))
-				# Clamp negative values (counter reset)
-				[ "$rx_speed" -lt 0 ] 2>/dev/null && rx_speed=0
-				[ "$tx_speed" -lt 0 ] 2>/dev/null && tx_speed=0
-			fi
-		fi
-
 		json_add_object ""
 		json_add_string "mac" "$mac"
-		json_add_string "ip" "${ip:-N/A}"
-		json_add_string "hostname" "${hostname:-unknown}"
+		json_add_string "ip" "$ip"
+		json_add_string "hostname" "$hostname"
 		json_add_string "band" "$band"
 		json_add_int "signal" "${signal:-0}"
 		json_add_string "tx_bitrate" "${tx_bitrate:-0}"
 		json_add_string "rx_bitrate" "${rx_bitrate:-0}"
 		json_add_int "rx_bytes" "${rx_bytes:-0}"
 		json_add_int "tx_bytes" "${tx_bytes:-0}"
-		json_add_int "rx_speed" "$rx_speed"
-		json_add_int "tx_speed" "$tx_speed"
+		json_add_int "rx_speed" "${rx_speed:-0}"
+		json_add_int "tx_speed" "${tx_speed:-0}"
 		json_add_int "inactive" "${inactive:-0}"
 		json_add_int "connected_time" "${connected:-0}"
 		json_close_object
@@ -148,58 +156,51 @@ get_clients() {
 
 	json_close_array
 
-	# Save current stats for next speed calculation
+	# Save stats for next speed calculation
 	{
 		echo "$now"
-		while IFS='|' read -r mac ip hostname band signal tx_bitrate rx_bitrate rx_bytes tx_bytes inactive connected; do
-			[ -n "$mac" ] && echo "${mac}|${rx_bytes}|${tx_bytes}"
-		done < "$tmpfile"
+		awk -F'|' '{print $1"|"$8"|"$9}' "$tmpfile"
 	} > "$prev_file"
 
 	json_dump
+	rm -f "$raw"
 }
 
-# Get DNS query history for a specific IP
+# Get DNS query history for a specific IP — single logread, single awk
 get_dns_history() {
 	local client_ip="$1"
 	json_init
 	json_add_array "hosts"
 
 	if [ -n "$client_ip" ]; then
-		# Parse dnsmasq logs from logread, get unique domains
-		logread 2>/dev/null | grep "dnsmasq\[" | grep "query\[A" | grep "from ${client_ip}$" | \
-			awk '{
-				# Extract domain name - it is the field after query[A] or query[AAAA] etc
-				for(i=1;i<=NF;i++) {
-					if ($i ~ /^query/) {
-						domain = $(i+1)
-						gsub(/\.$/, "", domain)
-						print domain
-					}
-				}
-			}' | sort -u | tail -15 | while read -r domain; do
-				[ -n "$domain" ] && {
-					json_add_string "" "$domain"
-				}
-			done
-
-		# If pipe subshell lost json context, use temp file approach instead
-		# Re-do with temp file for proper JSON building
-		json_cleanup
-		json_init
-		json_add_array "hosts"
-
 		local domains_file="$CACHE_DIR/dns_tmp"
-		logread 2>/dev/null | grep "dnsmasq\[" | grep "query\[A" | grep "from ${client_ip}$" | \
-			awk '{
-				for(i=1;i<=NF;i++) {
-					if ($i ~ /^query/) {
-						domain = $(i+1)
-						gsub(/\.$/, "", domain)
-						print domain
+		logread 2>/dev/null | awk -v ip="$client_ip" '
+			/dnsmasq\[/ && /query\[A/ && $0 ~ "from " ip "$" {
+				for (i = 1; i <= NF; i++) {
+					if ($i ~ /^query\[/) {
+						d = $(i+1)
+						sub(/\.$/, "", d)
+						seen[d] = NR
 					}
 				}
-			}' | sort -u | tail -15 > "$domains_file"
+			}
+			END {
+				# Sort by last seen (NR), output last 15
+				n = 0
+				for (d in seen) { n++; nr[n] = seen[d]; dom[n] = d }
+				# Simple insertion sort by NR descending
+				for (i = 2; i <= n; i++) {
+					j = i
+					while (j > 1 && nr[j] > nr[j-1]) {
+						t = nr[j]; nr[j] = nr[j-1]; nr[j-1] = t
+						t = dom[j]; dom[j] = dom[j-1]; dom[j-1] = t
+						j--
+					}
+				}
+				limit = (n < 15) ? n : 15
+				for (i = limit; i >= 1; i--) print dom[i]
+			}
+		' > "$domains_file"
 
 		while read -r domain; do
 			[ -n "$domain" ] && json_add_string "" "$domain"
